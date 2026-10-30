@@ -1,0 +1,1077 @@
+#!/usr/bin/env python3
+"""Check this machine's touchpad speed and clicks, and adjust them.
+
+Settings are saved with Cinnamon (org.cinnamon.desktop.peripherals.touchpad)
+and applied immediately through xinput.
+"""
+
+import math
+import re
+import shutil
+import subprocess
+import sys
+
+import cairo
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango, PangoCairo
+
+SCHEMA = "org.cinnamon.desktop.peripherals.touchpad"
+
+CLICK_CHOICES = (
+    ("default", "Default device behavior"),
+    ("areas", "Bottom corner buttons"),
+    ("fingers", "Press anywhere"),
+    ("none", "Off"),
+)
+SEND_CHOICES = (
+    ("enabled", "On"),
+    ("disabled", "Off"),
+    ("disabled-on-external-mouse", "Off while a mouse is plugged in"),
+)
+CLICK_PAIRS = {"areas": (1, 0), "fingers": (0, 1), "none": (0, 0)}
+SEND_PAIRS = {
+    "enabled": (0, 0),
+    "disabled": (1, 0),
+    "disabled-on-external-mouse": (0, 1),
+}
+CLICK_FROM_PAIR = {pair: key for key, pair in CLICK_PAIRS.items()}
+DIRECTION_CHOICES = (
+    ("up", "Down motion scrolls up (Windows 11)"),
+    ("down", "Down motion scrolls down"),
+)
+GESTURE_CHOICES = (
+    ("twofinger", "Two-finger drag (Windows 11)"),
+    ("edge", "Edge of the pad"),
+    ("none", "Off"),
+)
+GESTURE_VALUES = {
+    "twofinger": (1, 0, 0),
+    "edge": (0, 1, 0),
+    "none": (0, 0, 0),
+}
+BUTTON_NAMES = {1: "Left", 2: "Middle", 3: "Right", 8: "Back", 9: "Forward"}
+RESET_KEYS = (
+    "speed",
+    "tap-to-click",
+    "tap-and-drag",
+    "click-method",
+    "middle-click-emulation",
+    "natural-scroll",
+    "two-finger-scrolling-enabled",
+    "edge-scrolling-enabled",
+)
+
+NAME_RE = re.compile(r"↳\s+(.+?)\s+id=(\d+)")
+PROP_RE = re.compile(r"^\t(.+?) \(\d+\):\t(.*)$")
+
+
+def parse_prop_value(raw):
+    raw = raw.strip()
+    if raw == "<no items>":
+        return ()
+    if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+        return raw[1:-1]
+    values = []
+    for part in raw.split(","):
+        part = part.strip()
+        if re.fullmatch(r"-?\d+", part):
+            values.append(int(part))
+        else:
+            try:
+                values.append(float(part))
+            except ValueError:
+                values.append(part)
+    if len(values) == 1:
+        return values[0]
+    return tuple(values)
+
+
+def as_pair(value):
+    if isinstance(value, tuple):
+        if len(value) < 2:
+            return None
+        return (int(value[0]), int(value[1]))
+    return None
+
+
+def as_bool(value):
+    if isinstance(value, tuple):
+        return bool(value[0]) if value else False
+    return bool(int(value))
+
+
+def speed_phrase(value):
+    shown = f"{value:.2f}"
+    if abs(value) < 0.02:
+        return f"{shown} · Default"
+    if value > 0:
+        return f"{shown} · Faster"
+    return f"{shown} · Slower"
+
+
+def click_phrase(method, default_pair):
+    if method == "default":
+        baked = CLICK_FROM_PAIR.get(default_pair)
+        if baked == "areas":
+            return "Default (bottom corners on this pad)"
+        if baked == "fingers":
+            return "Default (finger count on this pad)"
+        if baked == "none":
+            return "Default (software buttons off on this pad)"
+        return "Default device behavior"
+    return dict(CLICK_CHOICES).get(method, method)
+
+
+def click_hint(method, default_pair=(1, 0)):
+    if method == "areas":
+        return (
+            "Bottom-left is left click, bottom-right is right click, and the "
+            "bottom center is middle click. A press on the rim is dropped when "
+            "the sensor misses your finger, because Linux cannot tell which "
+            "zone you meant."
+        )
+    if method == "fingers":
+        return (
+            "One finger pressed anywhere is a left click, including the "
+            "bottom-left edge. Linux keeps that click when the sensor misses "
+            "the finger. Right click is two fingers pressed down. Middle click "
+            "is a three-finger tap or a three-finger press. There is no middle "
+            "button zone."
+        )
+    if method == "none":
+        return (
+            "Corner and multi-finger button emulation is off. With tap to "
+            "click on, a tap still produces a left click."
+        )
+    baked = CLICK_FROM_PAIR.get(default_pair)
+    if baked == "fingers":
+        return (
+            "Uses the behavior built into the touchpad. One finger is a left "
+            "click anywhere, and middle click is a three-finger gesture."
+        )
+    if baked == "none":
+        return "Uses the behavior built into the touchpad: software buttons off."
+    return (
+        "Uses the behavior built into the touchpad: bottom-corner clicks. "
+        "A press on the rim can be dropped when the sensor misses your finger."
+    )
+
+
+def direction_hint(which):
+    if which == "up":
+        return (
+            "Windows 11’s default. Slide two fingers down and the content moves "
+            "down with them, so you see higher up the page. Slide two fingers "
+            "up and the content moves up, so you see further down the page."
+        )
+    return (
+        "Slide two fingers down and the page moves down, like a mouse wheel. "
+        "Slide two fingers up and the page moves up."
+    )
+
+
+def gesture_from_flags(two_finger, edge):
+    if two_finger:
+        return "twofinger"
+    if edge:
+        return "edge"
+    return "none"
+
+
+def direction_from_natural(enabled):
+    return "up" if enabled else "down"
+
+
+def gesture_hint(gesture):
+    if gesture == "edge":
+        return "Drag one finger along the right edge to scroll. Two-finger dragging will not scroll."
+    if gesture == "none":
+        return "Touchpad scrolling is off."
+    return (
+        "Windows 11 scrolls by dragging two fingers vertically or sideways. "
+        "The pad edge does not scroll."
+    )
+
+
+class TouchpadDevice:
+    """Live libinput state for the X touchpad device."""
+
+    def __init__(self):
+        self.available = shutil.which("xinput") is not None
+        self.error = None
+
+    def find(self):
+        if not self.available:
+            self.error = "xinput is not installed, so the device cannot be read."
+            return []
+        try:
+            out = subprocess.run(
+                ["xinput", "list"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        except (OSError, subprocess.CalledProcessError) as exc:
+            self.error = f"Could not list input devices ({exc})."
+            return []
+        found = []
+        for line in out.splitlines():
+            match = NAME_RE.search(line)
+            if not match:
+                continue
+            name, device_id = match.group(1).strip(), int(match.group(2))
+            if "touchpad" not in name.lower():
+                continue
+            found.append((device_id, name))
+        if not found:
+            self.error = "No touchpad is connected."
+        else:
+            self.error = None
+        return found
+
+    def read(self, device_id):
+        out = subprocess.run(
+            ["xinput", "list-props", str(device_id)],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        props = {}
+        for line in out.splitlines():
+            match = PROP_RE.match(line)
+            if match:
+                props[match.group(1)] = parse_prop_value(match.group(2))
+        node = props.get("Device Node")
+        return {
+            "speed": float(props.get("libinput Accel Speed", 0.0)),
+            "tap": as_bool(props.get("libinput Tapping Enabled", 0)),
+            "drag": as_bool(props.get("libinput Tapping Drag Enabled", 0)),
+            "middle": as_bool(props.get("libinput Middle Emulation Enabled", 0)),
+            "click": as_pair(props.get("libinput Click Method Enabled")),
+            "click_default": as_pair(props.get("libinput Click Method Enabled Default")),
+            "send": as_pair(props.get("libinput Send Events Mode Enabled")),
+            "natural": as_bool(props.get("libinput Natural Scrolling Enabled", 0)),
+            "scroll": props.get("libinput Scroll Method Enabled"),
+            "node": node if isinstance(node, str) else "",
+        }
+
+    def set_prop(self, device_id, name, *values):
+        subprocess.run(
+            ["xinput", "set-prop", str(device_id), name, *[str(v) for v in values]],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def apply(self, saved):
+        """Push saved settings onto every touchpad. Returns (devices, error)."""
+        devices = self.find()
+        if not devices:
+            return devices, self.error
+        errors = []
+        for device_id, name in devices:
+            try:
+                current = self.read(device_id)
+                default_click = current["click_default"] or (1, 0)
+                click = CLICK_PAIRS.get(saved["click-method"], default_click)
+                send = SEND_PAIRS.get(saved["send-events"], (0, 0))
+                gesture = gesture_from_flags(
+                    saved["two-finger-scrolling-enabled"],
+                    saved["edge-scrolling-enabled"],
+                )
+                scroll = GESTURE_VALUES[gesture]
+                self.set_prop(device_id, "libinput Accel Speed", f"{saved['speed']:.2f}")
+                self.set_prop(
+                    device_id,
+                    "libinput Natural Scrolling Enabled",
+                    int(saved["natural-scroll"]),
+                )
+                self.set_prop(
+                    device_id,
+                    "libinput Scroll Method Enabled",
+                    scroll[0],
+                    scroll[1],
+                    scroll[2],
+                )
+                self.set_prop(device_id, "libinput Tapping Enabled", int(saved["tap-to-click"]))
+                self.set_prop(
+                    device_id, "libinput Tapping Drag Enabled", int(saved["tap-and-drag"])
+                )
+                self.set_prop(
+                    device_id,
+                    "libinput Middle Emulation Enabled",
+                    int(saved["middle-click-emulation"]),
+                )
+                self.set_prop(device_id, "libinput Click Method Enabled", click[0], click[1])
+                self.set_prop(device_id, "libinput Send Events Mode Enabled", send[0], send[1])
+            except (OSError, subprocess.CalledProcessError) as exc:
+                detail = exc.stderr.strip() if getattr(exc, "stderr", None) else str(exc)
+                errors.append(f"{name}: {detail}")
+        return devices, "; ".join(errors) if errors else None
+
+
+def saved_matches(saved, live):
+    """Return human-readable differences between saved settings and the device."""
+    if live is None:
+        return ["The touchpad could not be read."]
+    diffs = []
+    if abs(live["speed"] - saved["speed"]) >= 0.02:
+        diffs.append(
+            f"speed is {live['speed']:.2f}, saved is {saved['speed']:.2f}"
+        )
+    if live["tap"] != saved["tap-to-click"]:
+        diffs.append(
+            "tap to click is " + ("on" if live["tap"] else "off")
+        )
+    if live["drag"] != saved["tap-and-drag"]:
+        diffs.append(
+            "tap and drag is " + ("on" if live["drag"] else "off")
+        )
+    if live["middle"] != saved["middle-click-emulation"]:
+        diffs.append(
+            "middle-click emulation is " + ("on" if live["middle"] else "off")
+        )
+    expected_click = CLICK_PAIRS.get(saved["click-method"], live["click_default"])
+    if live["click"] != expected_click:
+        diffs.append("click actions differ from the saved choice")
+    expected_send = SEND_PAIRS.get(saved["send-events"])
+    if expected_send and live["send"] != expected_send:
+        diffs.append("the on/off mode differs from the saved choice")
+    if "natural" in live and live["natural"] != saved["natural-scroll"]:
+        diffs.append(
+            "scroll direction is " + ("down motion scrolls up" if live["natural"] else "down motion scrolls down")
+        )
+    live_scroll = live.get("scroll")
+    if isinstance(live_scroll, tuple) and len(live_scroll) >= 2:
+        expected = GESTURE_VALUES[
+            gesture_from_flags(
+                saved["two-finger-scrolling-enabled"], saved["edge-scrolling-enabled"]
+            )
+        ]
+        if (int(live_scroll[0]), int(live_scroll[1])) != (expected[0], expected[1]):
+            diffs.append("the scroll gesture differs from the saved choice")
+    return diffs
+
+
+class TuneWindow(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Touchpad tuner")
+        self.set_icon_name("input-touchpad")
+        self.set_default_size(*self._window_size())
+        self.set_border_width(0)
+
+        self.device = TouchpadDevice()
+        self.settings = Gio.Settings.new(SCHEMA)
+        self._updating = False
+        self._writing = False
+        self._speed_src = None
+        self._refresh_src = None
+        self._decay_running = False
+
+        self._last_motion = None
+        self.trail = []
+        self.buttons_down = set()
+        self.flash_until = {}
+        self.last_click_name = None
+        self.speed_now = 0.0
+        self.peak = 0.0
+        self.moving_until = 0
+        self.peak_until = 0
+
+        self._build()
+        self._load_widgets()
+        self.refresh_status()
+        self.settings.connect("changed", self._on_settings_changed)
+        self.connect("map", self._queue_clamp)
+
+    def _queue_clamp(self, *_args):
+        GLib.idle_add(self._clamp_to_workarea)
+
+    def _clamp_to_workarea(self):
+        display = Gdk.Display.get_default()
+        gdk_window = self.get_window()
+        if display is None or gdk_window is None:
+            return False
+        monitor = display.get_monitor_at_window(gdk_window)
+        if monitor is None:
+            return False
+        work = monitor.get_workarea()
+        x, y = self.get_position()
+        width, height = self.get_size()
+        width = min(width, work.width)
+        height = min(height, work.height)
+        x = max(work.x, min(x, work.x + work.width - width))
+        y = max(work.y, min(y, work.y + work.height - height))
+        self.resize(width, height)
+        self.move(x, y)
+        return False
+
+    def _build(self):
+        header = Gtk.HeaderBar(title="Touchpad tuner", subtitle="Sensitivity, clicks, and scroll")
+        header.set_show_close_button(True)
+        check = Gtk.Button(label="Check again")
+        check.connect("clicked", lambda *_: self.refresh_status())
+        check.set_tooltip_text("Read the touchpad and compare it with the saved settings")
+        header.pack_end(check)
+        self.set_titlebar(header)
+
+        css = Gtk.CssProvider()
+        css.load_from_data(
+            b"""
+            .section { font-weight: 700; }
+            .card {
+                background-color: alpha(@theme_fg_color, 0.05);
+                border-radius: 10px;
+                padding: 12px 14px;
+            }
+            .status-title { font-weight: 700; }
+            """
+        )
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_overlay_scrolling(False)
+        scroll.set_vexpand(True)
+        self.add(scroll)
+
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        page.set_margin_start(14)
+        page.set_margin_end(14)
+        page.set_margin_top(12)
+        page.set_margin_bottom(12)
+        scroll.add(page)
+
+        self.status_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.status_card.get_style_context().add_class("card")
+        self.device_label = Gtk.Label(xalign=0)
+        self.device_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.device_label.get_style_context().add_class("status-title")
+        self.status_label = Gtk.Label(xalign=0)
+        self.status_label.set_line_wrap(True)
+        self.status_label.set_max_width_chars(46)
+        self.detail_label = Gtk.Label(xalign=0)
+        self.detail_label.set_line_wrap(True)
+        self.detail_label.set_max_width_chars(46)
+        self.detail_label.get_style_context().add_class("dim-label")
+        self.apply_button = Gtk.Button(label="Apply saved settings to the touchpad")
+        self.apply_button.set_halign(Gtk.Align.START)
+        self.apply_button.set_no_show_all(True)
+        self.apply_button.connect("clicked", lambda *_: self._push(reschedule=True))
+        self.status_card.pack_start(self.device_label, False, False, 0)
+        self.status_card.pack_start(self.status_label, False, False, 0)
+        self.status_card.pack_start(self.detail_label, False, False, 0)
+        self.status_card.pack_start(self.apply_button, False, False, 0)
+        page.pack_start(self.status_card, False, False, 0)
+
+        page.pack_start(self._section("Sensitivity"), False, False, 0)
+        speed_row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        caption_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        speed_name = Gtk.Label(label="Pointer speed", xalign=0)
+        speed_name.set_hexpand(True)
+        self.speed_value = Gtk.Label(xalign=1)
+        caption_row.pack_start(speed_name, True, True, 0)
+        caption_row.pack_start(self.speed_value, False, False, 0)
+        self.speed_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, -1, 1, 0.05)
+        self.speed_scale.set_draw_value(False)
+        self.speed_scale.set_increments(0.05, 0.2)
+        self.speed_scale.add_mark(0, Gtk.PositionType.BOTTOM, None)
+        self.speed_scale.connect("value-changed", self._on_speed)
+        ends = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        slower = Gtk.Label(label="Slower", xalign=0)
+        slower.get_style_context().add_class("dim-label")
+        slower.set_hexpand(True)
+        faster = Gtk.Label(label="Faster", xalign=1)
+        faster.get_style_context().add_class("dim-label")
+        ends.pack_start(slower, True, True, 0)
+        ends.pack_end(faster, False, False, 0)
+        speed_row.pack_start(caption_row, False, False, 0)
+        speed_row.pack_start(self.speed_scale, False, False, 0)
+        speed_row.pack_start(ends, False, False, 0)
+        page.pack_start(speed_row, False, False, 0)
+
+        page.pack_start(self._section("Scrolling"), False, False, 0)
+        direction_label = Gtk.Label(label="Scrolling direction", xalign=0)
+        self.direction_combo = Gtk.ComboBoxText()
+        self.direction_combo.set_hexpand(True)
+        for key, label in DIRECTION_CHOICES:
+            self.direction_combo.append(key, label)
+        self.direction_combo.connect("changed", self._on_direction)
+        self.direction_hint = Gtk.Label(xalign=0)
+        self.direction_hint.set_line_wrap(True)
+        self.direction_hint.set_max_width_chars(48)
+        self.direction_hint.get_style_context().add_class("dim-label")
+        gesture_label = Gtk.Label(label="Scroll gesture", xalign=0)
+        self.gesture_combo = Gtk.ComboBoxText()
+        self.gesture_combo.set_hexpand(True)
+        for key, label in GESTURE_CHOICES:
+            self.gesture_combo.append(key, label)
+        self.gesture_combo.connect("changed", self._on_gesture)
+        self.gesture_hint = Gtk.Label(xalign=0)
+        self.gesture_hint.set_line_wrap(True)
+        self.gesture_hint.set_max_width_chars(48)
+        self.gesture_hint.get_style_context().add_class("dim-label")
+        page.pack_start(direction_label, False, False, 0)
+        page.pack_start(self.direction_combo, False, False, 0)
+        page.pack_start(self.direction_hint, False, False, 0)
+        page.pack_start(gesture_label, False, False, 0)
+        page.pack_start(self.gesture_combo, False, False, 0)
+        page.pack_start(self.gesture_hint, False, False, 0)
+
+        page.pack_start(self._section("Clicks"), False, False, 0)
+        send_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        send_label = Gtk.Label(label="Touchpad", xalign=0)
+        send_label.set_hexpand(True)
+        self.send_combo = Gtk.ComboBoxText()
+        for key, label in SEND_CHOICES:
+            self.send_combo.append(key, label)
+        self.send_combo.connect("changed", self._on_send)
+        send_row.pack_start(send_label, True, True, 0)
+        send_row.pack_start(self.send_combo, False, False, 0)
+        page.pack_start(send_row, False, False, 0)
+
+        frame = Gtk.Frame()
+        frame.set_shadow_type(Gtk.ShadowType.IN)
+        clicks = Gtk.ListBox()
+        clicks.set_selection_mode(Gtk.SelectionMode.NONE)
+        frame.add(clicks)
+        self.tap_switch = self._switch_row(
+            clicks, "Tap to click", "Tap the pad instead of pressing it down."
+        )
+        self.drag_switch = self._switch_row(
+            clicks, "Tap and drag", "Leave the finger down after a tap to drag."
+        )
+        self.middle_switch = self._switch_row(
+            clicks,
+            "Middle click from both buttons",
+            "Press the left and right corners together.",
+        )
+        self.tap_switch.connect("notify::active", self._on_tap)
+        self.drag_switch.connect("notify::active", self._on_drag)
+        self.middle_switch.connect("notify::active", self._on_middle)
+        page.pack_start(frame, False, False, 0)
+
+        method_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        method_label = Gtk.Label(label="Click actions", xalign=0)
+        method_label.set_hexpand(True)
+        self.method_combo = Gtk.ComboBoxText()
+        for key, label in CLICK_CHOICES:
+            self.method_combo.append(key, label)
+        self.method_combo.connect("changed", self._on_method)
+        method_row.pack_start(method_label, True, True, 0)
+        method_row.pack_start(self.method_combo, False, False, 0)
+        self.method_hint = Gtk.Label(xalign=0)
+        self.method_hint.set_line_wrap(True)
+        self.method_hint.set_max_width_chars(48)
+        self.method_hint.get_style_context().add_class("dim-label")
+        page.pack_start(method_row, False, False, 0)
+        page.pack_start(self.method_hint, False, False, 0)
+
+        page.pack_start(self._section("Try it"), False, False, 0)
+        self.pad = Gtk.DrawingArea()
+        self.pad.set_size_request(-1, 132)
+        self.pad.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK
+            | Gdk.EventMask.LEAVE_NOTIFY_MASK
+            | Gdk.EventMask.ENTER_NOTIFY_MASK
+        )
+        self.pad.connect("draw", self._draw_pad)
+        self.pad.connect("button-press-event", self._on_press)
+        self.pad.connect("button-release-event", self._on_release)
+        self.pad.connect("motion-notify-event", self._on_motion)
+        self.pad.connect("leave-notify-event", self._on_leave)
+        page.pack_start(self.pad, False, False, 0)
+        self.try_label = Gtk.Label(
+            label="Move and click in the box. The line below reports the click that arrived and how fast the pointer moved.",
+            xalign=0,
+        )
+        self.try_label.set_line_wrap(True)
+        self.try_label.set_max_width_chars(48)
+        self.try_label.get_style_context().add_class("dim-label")
+        page.pack_start(self.try_label, False, False, 0)
+
+        bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        note = Gtk.Label(label="Changes are saved for your account.", xalign=0)
+        note.set_hexpand(True)
+        note.get_style_context().add_class("dim-label")
+        reset = Gtk.Button(label="Reset speed, clicks, and scroll")
+        reset.set_tooltip_text(
+            "Restore pointer speed, clicks, and scroll settings to the Cinnamon defaults"
+        )
+        reset.connect("clicked", self._on_reset)
+        bottom.pack_start(note, True, True, 0)
+        bottom.pack_end(reset, False, False, 0)
+        page.pack_start(bottom, False, False, 0)
+
+    def _window_size(self):
+        """Size the window to the monitor work area.
+
+        Gdk reports this display in application pixels (the same units as
+        set_default_size). The height has to stay inside the work area or the
+        try-out pad is left off the bottom of the screen.
+        """
+        display = Gdk.Display.get_default()
+        monitor = None
+        if display is not None:
+            monitor = display.get_primary_monitor() or (
+                display.get_monitor(0) if display.get_n_monitors() else None
+            )
+        if monitor is None:
+            return 500, 720
+        work = monitor.get_workarea()
+        # Stay inside the work area. Requesting the full height makes the
+        # window manager slide the title bar off the top of this display.
+        width = min(520, max(420, work.width - 80))
+        height = min(830, max(560, work.height - 130))
+        return width, height
+
+    def _section(self, text):
+        label = Gtk.Label(label=text, xalign=0)
+        label.get_style_context().add_class("section")
+        return label
+
+    def _switch_row(self, listbox, title, subtitle):
+        row = Gtk.ListBoxRow()
+        row.set_activatable(False)
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        text.set_hexpand(True)
+        title_label = Gtk.Label(label=title, xalign=0)
+        sub = Gtk.Label(label=subtitle, xalign=0)
+        sub.set_line_wrap(True)
+        sub.set_max_width_chars(40)
+        sub.get_style_context().add_class("dim-label")
+        text.pack_start(title_label, False, False, 0)
+        text.pack_start(sub, False, False, 0)
+        switch = Gtk.Switch()
+        switch.set_valign(Gtk.Align.CENTER)
+        switch.set_halign(Gtk.Align.END)
+        box.pack_start(text, True, True, 0)
+        box.pack_start(switch, False, False, 0)
+        row.add(box)
+        listbox.add(row)
+        return switch
+
+    def _saved(self):
+        return {
+            "speed": self.settings.get_double("speed"),
+            "tap-to-click": self.settings.get_boolean("tap-to-click"),
+            "tap-and-drag": self.settings.get_boolean("tap-and-drag"),
+            "middle-click-emulation": self.settings.get_boolean("middle-click-emulation"),
+            "click-method": self.settings.get_string("click-method"),
+            "send-events": self.settings.get_string("send-events"),
+            "natural-scroll": self.settings.get_boolean("natural-scroll"),
+            "two-finger-scrolling-enabled": self.settings.get_boolean(
+                "two-finger-scrolling-enabled"
+            ),
+            "edge-scrolling-enabled": self.settings.get_boolean("edge-scrolling-enabled"),
+        }
+
+    def _load_widgets(self):
+        saved = self._saved()
+        self._updating = True
+        try:
+            self.speed_scale.set_value(saved["speed"])
+            self.speed_value.set_text(speed_phrase(saved["speed"]))
+            self.tap_switch.set_active(saved["tap-to-click"])
+            self.drag_switch.set_active(saved["tap-and-drag"])
+            self.middle_switch.set_active(saved["middle-click-emulation"])
+            self.method_combo.set_active_id(saved["click-method"])
+            self.send_combo.set_active_id(saved["send-events"])
+            direction = direction_from_natural(saved["natural-scroll"])
+            self.direction_combo.set_active_id(direction)
+            self.direction_hint.set_text(direction_hint(direction))
+            gesture = gesture_from_flags(
+                saved["two-finger-scrolling-enabled"],
+                saved["edge-scrolling-enabled"],
+            )
+            self.gesture_combo.set_active_id(gesture)
+            self.gesture_hint.set_text(gesture_hint(gesture))
+            self.method_hint.set_text(click_hint(saved["click-method"], getattr(self, "_default_click", (1, 0))))
+            self.drag_switch.set_sensitive(saved["tap-to-click"])
+        finally:
+            self._updating = False
+
+    def _on_settings_changed(self, _settings, key):
+        if self._writing:
+            return
+        if key not in RESET_KEYS and key != "send-events":
+            return
+        self._load_widgets()
+        self.refresh_status()
+
+    def _write(self, key, value):
+        self._writing = True
+        try:
+            if isinstance(value, bool):
+                self.settings.set_boolean(key, value)
+            elif isinstance(value, float):
+                self.settings.set_double(key, value)
+            else:
+                self.settings.set_string(key, value)
+        finally:
+            self._writing = False
+
+    def _push(self, reschedule=True):
+        _devices, error = self.device.apply(self._saved())
+        self._apply_error = error
+        if reschedule:
+            if self._refresh_src:
+                GLib.source_remove(self._refresh_src)
+            self._refresh_src = GLib.timeout_add(200, self._refresh_later)
+
+    def _refresh_later(self):
+        self._refresh_src = None
+        self.refresh_status()
+        return False
+
+    def _commit_speed(self):
+        self._speed_src = None
+        value = round(self.speed_scale.get_value(), 2)
+        self._write("speed", value)
+        self._push()
+        return False
+
+    def _on_speed(self, scale):
+        if self._updating:
+            return
+        self.speed_value.set_text(speed_phrase(scale.get_value()))
+        if self._speed_src:
+            GLib.source_remove(self._speed_src)
+        self._speed_src = GLib.timeout_add(60, self._commit_speed)
+
+    def _on_tap(self, switch, _pspec):
+        if self._updating:
+            return
+        active = switch.get_active()
+        self.drag_switch.set_sensitive(active)
+        self._write("tap-to-click", active)
+        self._push()
+
+    def _on_drag(self, switch, _pspec):
+        if self._updating:
+            return
+        self._write("tap-and-drag", switch.get_active())
+        self._push()
+
+    def _on_middle(self, switch, _pspec):
+        if self._updating:
+            return
+        self._write("middle-click-emulation", switch.get_active())
+        self._push()
+
+    def _on_method(self, combo):
+        if self._updating:
+            return
+        method = combo.get_active_id()
+        if not method:
+            return
+        self.method_hint.set_text(click_hint(method, getattr(self, "_default_click", (1, 0))))
+        self._write("click-method", method)
+        self._push()
+
+    def _on_direction(self, combo):
+        if self._updating:
+            return
+        which = combo.get_active_id()
+        if not which:
+            return
+        self.direction_hint.set_text(direction_hint(which))
+        self._write("natural-scroll", which == "up")
+        self._push()
+
+    def _on_gesture(self, combo):
+        if self._updating:
+            return
+        gesture = combo.get_active_id()
+        if gesture == "twofinger":
+            flags = (("two-finger-scrolling-enabled", True), ("edge-scrolling-enabled", False))
+        elif gesture == "edge":
+            flags = (("two-finger-scrolling-enabled", False), ("edge-scrolling-enabled", True))
+        elif gesture == "none":
+            flags = (("two-finger-scrolling-enabled", False), ("edge-scrolling-enabled", False))
+        else:
+            return
+        self.gesture_hint.set_text(gesture_hint(gesture))
+        self._writing = True
+        try:
+            for key, value in flags:
+                self.settings.set_boolean(key, value)
+        finally:
+            self._writing = False
+        self._push()
+
+    def _on_send(self, combo):
+        if self._updating:
+            return
+        mode = combo.get_active_id()
+        if not mode:
+            return
+        self._write("send-events", mode)
+        self._push()
+
+    def _on_reset(self, *_args):
+        self._writing = True
+        try:
+            for key in RESET_KEYS:
+                self.settings.reset(key)
+        finally:
+            self._writing = False
+        self._load_widgets()
+        self._push()
+
+    def refresh_status(self):
+        saved = self._saved()
+        devices = self.device.find()
+        live = None
+        if devices:
+            try:
+                live = self.device.read(devices[0][0])
+            except (OSError, subprocess.CalledProcessError) as exc:
+                self.device.error = str(exc)
+        if devices:
+            device_id, name = devices[0]
+            extra = f" · id {device_id}"
+            if live and live["node"]:
+                extra += f" · {live['node']}"
+            self.device_label.set_text(name)
+            self.device_label.set_tooltip_text(name + extra)
+        else:
+            self.device_label.set_text("Touchpad")
+            self.device_label.set_tooltip_text("")
+
+        if live is not None and live.get("click_default"):
+            self._default_click = live["click_default"]
+            method = self.method_combo.get_active_id()
+            if method:
+                self.method_hint.set_text(click_hint(method, self._default_click))
+
+        if live is None:
+            self.status_label.set_text(self.device.error or "The touchpad could not be read.")
+            self.detail_label.set_text(
+                "Saved settings stay on this account and apply when a touchpad is available."
+            )
+            self.apply_button.set_visible(False)
+            return
+
+        diffs = saved_matches(saved, live)
+        error = getattr(self, "_apply_error", None)
+        if error:
+            self.status_label.set_text("Could not update the device.")
+            self.detail_label.set_text(error)
+            self.apply_button.set_visible(True)
+            return
+        if diffs:
+            self.status_label.set_text("Saved settings are not on the device yet.")
+            self.detail_label.set_text("The touchpad reports: " + "; ".join(diffs) + ".")
+            self.apply_button.set_visible(True)
+        else:
+            self.status_label.set_text("Saved settings match the touchpad.")
+            send = dict(SEND_CHOICES).get(saved["send-events"], saved["send-events"])
+            detail = (
+                f"On the device: speed {live['speed']:.2f}, "
+                f"tap to click {'on' if live['tap'] else 'off'}, "
+                f"tap and drag {'on' if live['drag'] else 'off'}, "
+                f"{click_phrase(saved['click-method'], live['click_default'])}, "
+                f"middle click {'on' if live['middle'] else 'off'}, "
+                f"{'down motion scrolls up' if saved['natural-scroll'] else 'down motion scrolls down'}, "
+                f"{dict(GESTURE_CHOICES).get(gesture_from_flags(saved['two-finger-scrolling-enabled'], saved['edge-scrolling-enabled']), 'scroll')}. "
+                f"Touchpad is {send.lower()}."
+            )
+            self.detail_label.set_text(detail)
+            self.apply_button.set_visible(False)
+
+    def _poke(self):
+        self._update_try_label()
+        self.pad.queue_draw()
+        if not self._decay_running:
+            self._decay_running = True
+            GLib.timeout_add(50, self._decay)
+
+    def _decay(self):
+        now = GLib.get_monotonic_time() // 1000
+        alive = (
+            bool(self.buttons_down)
+            or now < self.moving_until
+            or now < self.peak_until
+            or any(now < until for until in self.flash_until.values())
+        )
+        self._update_try_label()
+        self.pad.queue_draw()
+        if not alive:
+            self._decay_running = False
+        return alive
+
+    def _update_try_label(self):
+        now = GLib.get_monotonic_time() // 1000
+        if self.last_click_name:
+            click = f"Last click: {self.last_click_name}"
+        else:
+            click = "No click yet"
+        if now < self.moving_until:
+            motion = f"moving at {self.speed_now:.0f} px/s"
+        elif self.peak > 0 and now < self.peak_until:
+            motion = f"last sweep peaked at {self.peak:.0f} px/s"
+        else:
+            motion = "move across the box to measure speed"
+        self.try_label.set_text(f"{click} · {motion}.")
+
+    def _on_press(self, _widget, event):
+        button = int(event.button)
+        self.buttons_down.add(button)
+        self.last_click_name = BUTTON_NAMES.get(button, f"Button {button}")
+        self.flash_until[button] = (GLib.get_monotonic_time() // 1000) + 700
+        self._poke()
+        return True
+
+    def _on_release(self, _widget, event):
+        button = int(event.button)
+        self.buttons_down.discard(button)
+        self.flash_until[button] = (GLib.get_monotonic_time() // 1000) + 700
+        self._poke()
+        return True
+
+    def _on_motion(self, _widget, event):
+        now_event = event.time
+        if self._last_motion is not None:
+            last_x, last_y, last_t = self._last_motion
+            dt = (now_event - last_t) / 1000.0
+            if 0 < dt < 0.2:
+                inst = math.hypot(event.x - last_x, event.y - last_y) / dt
+                self.speed_now = self.speed_now * 0.65 + inst * 0.35
+                if inst > self.peak:
+                    self.peak = inst
+                now = GLib.get_monotonic_time() // 1000
+                self.moving_until = now + 180
+                self.peak_until = now + 1400
+        self._last_motion = (event.x, event.y, now_event)
+        self.trail.append((event.x, event.y, now_event))
+        if len(self.trail) > 48:
+            del self.trail[:-48]
+        self._poke()
+        return False
+
+    def _on_leave(self, _widget, _event):
+        self._last_motion = None
+        self.trail.clear()
+        self.buttons_down.clear()
+        self.moving_until = 0
+        self._poke()
+        return False
+
+    def _color(self, name, fallback):
+        found, color = self.pad.get_style_context().lookup_color(name)
+        if found:
+            return color
+        color = Gdk.RGBA()
+        color.parse(fallback)
+        return color
+
+    def _draw_pad(self, widget, cr):
+        width = widget.get_allocated_width()
+        height = widget.get_allocated_height()
+        radius = 10
+        base = self._color("theme_base_color", "#ffffff")
+        fg = self._color("theme_fg_color", "#202020")
+        accent = self._color("theme_selected_bg_color", "#1a73e8")
+        accent_fg = self._color("theme_selected_fg_color", "#ffffff")
+
+        cr.new_sub_path()
+        cr.arc(width - radius, radius, radius, -math.pi / 2, 0)
+        cr.arc(width - radius, height - radius, radius, 0, math.pi / 2)
+        cr.arc(radius, height - radius, radius, math.pi / 2, math.pi)
+        cr.arc(radius, radius, radius, math.pi, 3 * math.pi / 2)
+        cr.close_path()
+        cr.set_source_rgba(base.red, base.green, base.blue, 1)
+        cr.fill_preserve()
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.18)
+        cr.set_line_width(1)
+        cr.stroke()
+
+        if len(self.trail) >= 2:
+            cr.set_line_width(2.6)
+            cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            newest = self.trail[-1][2]
+            for (x0, y0, _t0), (x1, y1, t1) in zip(self.trail, self.trail[1:]):
+                alpha = max(0.0, 1.0 - (newest - t1) / 350.0)
+                cr.set_source_rgba(accent.red, accent.green, accent.blue, alpha)
+                cr.move_to(x0, y0)
+                cr.line_to(x1, y1)
+                cr.stroke()
+
+        prompt = widget.create_pango_layout("Move and click here")
+        prompt.set_font_description(Pango.FontDescription("Sans 11"))
+        pw, ph = prompt.get_pixel_size()
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.55)
+        cr.move_to((width - pw) / 2, 16)
+        PangoCairo.show_layout(cr, prompt)
+
+        now = GLib.get_monotonic_time() // 1000
+        labels = ((1, "Left"), (2, "Middle"), (3, "Right"))
+        gap = 8
+        pad = 14
+        pill_h = 28
+        pill_w = (width - pad * 2 - gap * 2) / 3
+        pill_y = height - pad - pill_h
+        for index, (button, text) in enumerate(labels):
+            hot = button in self.buttons_down or now < self.flash_until.get(button, 0)
+            x = pad + index * (pill_w + gap)
+            cr.new_sub_path()
+            r = pill_h / 2
+            cr.arc(x + pill_w - r, pill_y + r, r, -math.pi / 2, math.pi / 2)
+            cr.arc(x + r, pill_y + r, r, math.pi / 2, 3 * math.pi / 2)
+            cr.close_path()
+            if hot:
+                cr.set_source_rgba(accent.red, accent.green, accent.blue, 0.95)
+            else:
+                cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.08)
+            cr.fill()
+            layout = widget.create_pango_layout(text)
+            layout.set_font_description(Pango.FontDescription("Sans 10"))
+            tw, th = layout.get_pixel_size()
+            if hot:
+                cr.set_source_rgba(accent_fg.red, accent_fg.green, accent_fg.blue, 1)
+            else:
+                cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.75)
+            cr.move_to(x + (pill_w - tw) / 2, pill_y + (pill_h - th) / 2)
+            PangoCairo.show_layout(cr, layout)
+        return False
+
+
+def main():
+    source = Gio.SettingsSchemaSource.get_default()
+    if source is None or source.lookup(SCHEMA, True) is None:
+        print(f"Missing settings schema {SCHEMA}", file=sys.stderr)
+        return 1
+    app = Gtk.Application(
+        application_id="local.touchpad.Tune", flags=Gio.ApplicationFlags.FLAGS_NONE
+    )
+
+    def activate(_app):
+        windows = _app.get_windows()
+        if windows:
+            windows[0].present()
+            return
+        window = TuneWindow(_app)
+        window.show_all()
+        window.apply_button.set_visible(False)
+        window.refresh_status()
+
+    app.connect("activate", activate)
+    return app.run(sys.argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

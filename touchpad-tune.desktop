@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Touchpad tuner
+GenericName=Touchpad settings
+Comment=Check touchpad sensitivity and clicks, and adjust them
+Exec=/bin/sh -c "exec \"$HOME/.local/bin/touchpad-tune\""
+Icon=input-touchpad
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=touchpad;trackpad;sensitivity;click;tap;pointer;scroll;
+StartupNotify=true
+StartupWMClass=touchpad-tune
